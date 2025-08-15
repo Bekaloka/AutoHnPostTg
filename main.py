@@ -1,204 +1,121 @@
 #!/usr/bin/env python3
-"""
-🔥 TechNewsBot — постит топ новости Hacker News в Telegram
-- Источник: официальный API Hacker News
-- Перевод через Gemini API
-- 3 поста в день: 09:00, 12:00, 18:00 МСК
-- При запуске сразу постит топ-1 новость
-"""
-
 import asyncio
 import logging
 import os
 from datetime import datetime
-from typing import List, Dict
+from typing import Dict, Optional
 
 import aiohttp
+import feedparser
+import trafilatura
 import google.generativeai as genai
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# ======= CONFIG =======
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 class Config:
-    TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    TELEGRAM_CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID')
-    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-
-    HN_TOP_URL = "https://hacker-news.firebaseio.com/v0/topstories.json"
-    HN_ITEM_URL = "https://hacker-news.firebaseio.com/v0/item/{}.json"
-
+    TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN')
+    TELEGRAM_CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID', '@your_channel')
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'YOUR_GEMINI_KEY')
+    HN_SOURCE = 'https://hnrss.org/frontpage?points=100'
     POST_TIMES = ['09:00', '12:00', '18:00']
     TIMEZONE = 'Europe/Moscow'
 
-
-# ======= LOGGING =======
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-
-# ======= HN PARSER =======
-class HackerNewsAPI:
+class HackerNewsBot:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
-
-    async def get_top_stories_ids(self) -> List[int]:
-        async with self.session.get(Config.HN_TOP_URL) as resp:
-            ids = await resp.json()
-        return ids[:20]  # Берем первые 20 для фильтрации
-
-    async def get_item(self, item_id: int) -> Dict:
-        async with self.session.get(Config.HN_ITEM_URL.format(item_id)) as resp:
-            return await resp.json()
-
-    async def get_top_stories(self, limit=3) -> List[Dict]:
-        ids = await self.get_top_stories_ids()
-        items = await asyncio.gather(*(self.get_item(i) for i in ids))
-        # Оставляем только статьи
-        stories = [it for it in items if it and it.get("type") == "story" and "url" in it]
-        return stories[:limit]
-
-
-# ======= GEMINI TRANSLATOR =======
-class GeminiTranslator:
-    def __init__(self):
         genai.configure(api_key=Config.GEMINI_API_KEY)
         self.model = genai.GenerativeModel('gemini-2.5-flash')
 
-    async def translate(self, text: str) -> str:
+    async def get_top_story(self) -> Optional[Dict]:
+        """Берёт топ-1 новость с Hacker News"""
         try:
-            prompt = f"Переведи на русский, сохрани технические термины:\n\n{text}"
-            resp = await asyncio.to_thread(self.model.generate_content, prompt)
-            return resp.text.strip()
+            async with self.session.get(Config.HN_SOURCE) as resp:
+                feed = feedparser.parse(await resp.text())
+
+            if not feed.entries:
+                return None
+
+            entry = feed.entries[0]
+            return {
+                "title": entry.title,
+                "link": entry.link
+            }
+        except Exception as e:
+            logger.error(f"Ошибка получения топ новости: {e}")
+            return None
+
+    async def fetch_article_text(self, url: str) -> str:
+        """Скачивает полный текст статьи"""
+        try:
+            async with self.session.get(url) as resp:
+                html = await resp.text()
+            text = trafilatura.extract(html)
+            return text or "Не удалось извлечь текст."
+        except Exception as e:
+            logger.error(f"Ошибка скачивания статьи: {e}")
+            return "Не удалось извлечь текст."
+
+    async def translate_text(self, text: str) -> str:
+        """Перевод текста через Gemini"""
+        try:
+            prompt = f"Переведи текст на русский, сохрани смысл и структуру:\n\n{text}"
+            response = await asyncio.to_thread(self.model.generate_content, prompt)
+            return response.text.strip()
         except Exception as e:
             logger.error(f"Ошибка перевода: {e}")
             return text
 
+    async def send_to_telegram(self, title: str, translated_text: str, link: str):
+        """Отправка поста в Telegram"""
+        post = f"🔥 <b>{title}</b>\n\n✍️ {translated_text}\n\n🔗 <a href='{link}'>Читать оригинал</a>"
+        try:
+            async with self.session.post(
+                f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": Config.TELEGRAM_CHANNEL_ID,
+                    "text": post,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": False
+                }
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"Ошибка отправки в Telegram: {resp.status}")
+        except Exception as e:
+            logger.error(f"Ошибка Telegram API: {e}")
 
-# ======= TELEGRAM POSTER =======
-class TelegramPoster:
-    def __init__(self, session: aiohttp.ClientSession):
-        self.session = session
-        self.base_url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}"
-
-    async def send_message(self, text: str) -> bool:
-        url = f"{self.base_url}/sendMessage"
-        data = {
-            "chat_id": Config.TELEGRAM_CHANNEL_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False
-        }
-        async with self.session.post(url, json=data) as resp:
-            if resp.status == 200:
-                logger.info("✅ Сообщение отправлено")
-                return True
-            logger.error(f"Ошибка TG API: {resp.status}")
-            return False
-
-
-# ======= MAIN BOT =======
-class TechNewsBot:
-    def __init__(self):
-        self.session = None
-        self.hn = None
-        self.translator = None
-        self.poster = None
-        self.scheduler = AsyncIOScheduler(timezone=Config.TIMEZONE)
-
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        self.hn = HackerNewsAPI(self.session)
-        self.translator = GeminiTranslator()
-        self.poster = TelegramPoster(self.session)
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if self.session:
-            await self.session.close()
-
-    async def make_post(self, limit=3):
-        logger.info("📡 Получаю новости...")
-        stories = await self.hn.get_top_stories(limit=limit)
-
-        if not stories:
-            logger.warning("Нет новостей")
+    async def process_and_post(self):
+        """Основная логика"""
+        logger.info("Загрузка топ новости...")
+        story = await self.get_top_story()
+        if not story:
+            logger.warning("Нет новостей для публикации")
             return
 
-        translated = []
-        for st in stories:
-            tr_title = await self.translator.translate(st['title'])
-            translated.append((tr_title, st['url']))
+        logger.info(f"Новость: {story['title']}")
+        article_text = await self.fetch_article_text(story["link"])
+        translated_title = await self.translate_text(story["title"])
+        translated_article = await self.translate_text(article_text)
+        await self.send_to_telegram(translated_title, translated_article, story["link"])
 
-        now = datetime.now().strftime("%H:%M")
-        text = f"🔥 <b>Топ Hacker News {now} МСК</b>\n\n"
-        for i, (title, link) in enumerate(translated, 1):
-            text += f"<b>{i}. {title}</b>\n🔗 <a href='{link}'>Читать</a>\n\n"
+async def main():
+    async with aiohttp.ClientSession() as session:
+        bot = HackerNewsBot(session)
+        scheduler = AsyncIOScheduler(timezone=Config.TIMEZONE)
 
-        await self.poster.send_message(text)
+        # Пост сразу при запуске
+        await bot.process_and_post()
 
-    async def post_startup_news(self):
-        logger.info("🚀 Постим стартовую новость...")
-        await self.make_post(limit=1)
-
-    def schedule_jobs(self):
+        # Запуск по расписанию
         for t in Config.POST_TIMES:
-            h, m = map(int, t.split(":"))
-            self.scheduler.add_job(self.make_post, CronTrigger(hour=h, minute=m))
+            h, m = map(int, t.split(':'))
+            scheduler.add_job(bot.process_and_post, CronTrigger(hour=h, minute=m))
+        scheduler.start()
 
-    async def run(self):
-        await self.post_startup_news()
-        self.schedule_jobs()
-        self.scheduler.start()
         while True:
             await asyncio.sleep(60)
 
-
-async def main():
-    if not all([Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHANNEL_ID, Config.GEMINI_API_KEY]):
-        logger.error("❌ Не заданы переменные окружения")
-        exit(1)
-    async with TechNewsBot() as bot:
-        await bot.run()
-
-
 if __name__ == "__main__":
-    asyncio.run(main())ranslator.translate_to_russian(top_news['title'])
-            
-            # Формируем стартовый пост
-            startup_post = f"🔥 <b>Топ новость HackerNews:</b>\n\n"
-            startup_post += f"<b>{translated_title}</b>\n"
-            startup_post += f"💬 {top_news['points']} очков\n"
-            startup_post += f"🔗 <a href='{top_news['link']}'>Читать далее</a>"
-            
-            # Отправляем
-            success = await self.poster.send_message(startup_post)
-            
-            if success:
-                logger.info("🎉 Стартовая новость успешно опубликована!")
-            else:
-                logger.error("❌ Ошибка публикации стартовой новости")
-                
-        except Exception as e:
-            logger.error(f"Ошибка в post_startup_news: {e}")
-
-async def main():
-    """Основная функция запуска"""
-    # Railway автоматически запускает в production режиме
-    async with TechNewsBot() as bot:
-        await bot.run_forever()
-
-if __name__ == "__main__":
-    # Railway автоматически передаст переменные окружения
-    required_vars = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHANNEL_ID', 'GEMINI_API_KEY']
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    
-    if missing_vars:
-        logger.error(f"❌ Не заданы переменные окружения: {', '.join(missing_vars)}")
-        logger.error("Добавьте их в Railway Dashboard -> Variables")
-        exit(1)
-    
-    logger.info("🚀 Запуск Tech News Bot на Railway...")
     asyncio.run(main())
