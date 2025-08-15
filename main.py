@@ -89,6 +89,8 @@ schedule.every().day.at("12:00").do(job)
 schedule.every().day.at("18:00").do(job)
 
 print("✅ Бот запущен! Ждём времени постинга...")
+# Первый запуск сразу при старте бота
+post_top_news()
 while True:
     schedule.run_pending()
     time.sleep(30)
