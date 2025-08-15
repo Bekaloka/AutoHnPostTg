@@ -1,87 +1,94 @@
-import aiohttp
-import asyncio
-import json
 import os
-import feedparser
+import requests
 import trafilatura
-import google.generativeai as genai
-from datetime import datetime
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime, timedelta
+import pytz
+import schedule
+import time
 from telegram import Bot
+import google.generativeai as genai
 
-# === Настройки ===
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-POSTED_FILE = "posted.json"
+# --- Настройки токенов и чата ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or "1234567890:ABCdefGhIJKlmnOPQrstUVwxYZ"
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "@имя_твоего_канала"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or "ВАШ_GEMINI_API_KEY"
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-pro")
+if ":" not in TELEGRAM_TOKEN:
+    raise ValueError("❌ TELEGRAM_TOKEN пустой или неверный. Укажи токен от BotFather!")
+
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# === Функции ===
+# --- Настройки Gemini API ---
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-pro")
 
-def load_posted():
-    if os.path.exists(POSTED_FILE):
-        with open(POSTED_FILE, "r") as f:
-            return json.load(f)
-    return []
+# --- Память о последних постах (чтобы не было дублей) ---
+posted_ids = []
 
-def save_posted(posted):
-    with open(POSTED_FILE, "w") as f:
-        json.dump(posted, f)
+# --- Получение топ-новостей с Hacker News ---
+def get_top_hn_articles(limit=10):
+    top_ids = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json").json()
+    articles = []
+    for item_id in top_ids[:limit]:
+        item = requests.get(f"https://hacker-news.firebaseio.com/v0/item/{item_id}.json").json()
+        if item and "url" in item:
+            articles.append({"id": item_id, "title": item["title"], "url": item["url"]})
+    return articles
 
-async def fetch_hn_top():
-    url = "https://hnrss.org/frontpage"
-    feed = feedparser.parse(url)
-    return feed.entries
-
-async def get_full_text(url):
+# --- Скачивание и очистка текста ---
+def extract_full_text(url):
     downloaded = trafilatura.fetch_url(url)
     if downloaded:
         return trafilatura.extract(downloaded)
     return None
 
-async def translate_text(text):
-    prompt = f"""Переведи следующий текст на русский язык, сохранив смысл и структуру, но:
-- Удали любые строки с пометками вида "(Оценка:...)" или "Re:".
-- Удали дублирующиеся предложения или абзацы.
-- Игнорируй технические и служебные вставки, которые не относятся к содержанию статьи.
-- Оставь только связный, чистый и читабельный текст.
+# --- Перевод текста через Gemini ---
+def translate_text(text):
+    prompt = f"""
+Ты — профессиональный переводчик технических новостей.
+Переведи на русский язык текст ниже, сохранив стиль и смысл.
+Удали мусорные комментарии, рейтинги, оценки вида (Оценка:5) и подобное.
 
 Текст для перевода:
+{text}
+"""
+    response = model.generate_content(prompt)
+    return response.text.strip()
 
-{text}"""
-    resp = model.generate_content(prompt)
-    return resp.text.strip()
+# --- Публикация в Telegram ---
+def post_to_telegram(title, translated_text, url):
+    message = f"🔥 **{title}**\n\n{translated_text}\n\n🔗 [Читать оригинал]({url})"
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
 
-async def post_news():
-    posted = load_posted()
-    entries = await fetch_hn_top()
+# --- Основная логика ---
+def job():
+    global posted_ids
+    print("🚀 Запуск задачи:", datetime.now(pytz.timezone("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S"))
 
-    for entry in entries:
-        if entry.link in posted:
-            continue  # пропускаем уже постнутые
-        full_text = await get_full_text(entry.link)
-        if not full_text:
-            continue
-        translated = await translate_text(full_text)
-        message = f"🔥 *{entry.title}*\n\n{translated}\n\n🔗 {entry.link}"
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
-        posted.append(entry.link)
-        save_posted(posted)
-        break  # публикуем только одну новость за запуск
+    articles = get_top_hn_articles(limit=10)
 
-# === Планировщик ===
-async def main():
-    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(post_news, "cron", hour=9, minute=0)
-    scheduler.add_job(post_news, "cron", hour=12, minute=0)
-    scheduler.add_job(post_news, "cron", hour=18, minute=0)
-    scheduler.start()
-    print("Бот запущен. Ждём времени постинга...")
-    while True:
-        await asyncio.sleep(3600)
+    count = 0
+    for article in articles:
+        if article["id"] in posted_ids:
+            continue  # Пропускаем, если уже постили
+        text = extract_full_text(article["url"])
+        if text:
+            translated = translate_text(text)
+            post_to_telegram(article["title"], translated, article["url"])
+            posted_ids.append(article["id"])
+            count += 1
+        if count >= 3:
+            break
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    # Храним только последние 30 ID
+    posted_ids = posted_ids[-30:]
+
+# --- Планировщик ---
+schedule.every().day.at("09:00").do(job)
+schedule.every().day.at("12:00").do(job)
+schedule.every().day.at("18:00").do(job)
+
+print("✅ Бот запущен! Ждём времени постинга...")
+while True:
+    schedule.run_pending()
+    time.sleep(30)
