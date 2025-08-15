@@ -1,121 +1,87 @@
-#!/usr/bin/env python3
-import asyncio
-import logging
-import os
-from datetime import datetime
-from typing import Dict, Optional
-
 import aiohttp
+import asyncio
+import json
+import os
 import feedparser
 import trafilatura
 import google.generativeai as genai
+from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+from telegram import Bot
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# === Настройки ===
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+POSTED_FILE = "posted.json"
 
-class Config:
-    TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN')
-    TELEGRAM_CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID', '@your_channel')
-    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'YOUR_GEMINI_KEY')
-    HN_SOURCE = 'https://hnrss.org/frontpage?points=100'
-    POST_TIMES = ['09:00', '12:00', '18:00']
-    TIMEZONE = 'Europe/Moscow'
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-pro")
+bot = Bot(token=TELEGRAM_TOKEN)
 
-class HackerNewsBot:
-    def __init__(self, session: aiohttp.ClientSession):
-        self.session = session
-        genai.configure(api_key=Config.GEMINI_API_KEY)
-        self.model = genai.GenerativeModel('gemini-2.5-flash')
+# === Функции ===
 
-    async def get_top_story(self) -> Optional[Dict]:
-        """Берёт топ-1 новость с Hacker News"""
-        try:
-            async with self.session.get(Config.HN_SOURCE) as resp:
-                feed = feedparser.parse(await resp.text())
+def load_posted():
+    if os.path.exists(POSTED_FILE):
+        with open(POSTED_FILE, "r") as f:
+            return json.load(f)
+    return []
 
-            if not feed.entries:
-                return None
+def save_posted(posted):
+    with open(POSTED_FILE, "w") as f:
+        json.dump(posted, f)
 
-            entry = feed.entries[0]
-            return {
-                "title": entry.title,
-                "link": entry.link
-            }
-        except Exception as e:
-            logger.error(f"Ошибка получения топ новости: {e}")
-            return None
+async def fetch_hn_top():
+    url = "https://hnrss.org/frontpage"
+    feed = feedparser.parse(url)
+    return feed.entries
 
-    async def fetch_article_text(self, url: str) -> str:
-        """Скачивает полный текст статьи"""
-        try:
-            async with self.session.get(url) as resp:
-                html = await resp.text()
-            text = trafilatura.extract(html)
-            return text or "Не удалось извлечь текст."
-        except Exception as e:
-            logger.error(f"Ошибка скачивания статьи: {e}")
-            return "Не удалось извлечь текст."
+async def get_full_text(url):
+    downloaded = trafilatura.fetch_url(url)
+    if downloaded:
+        return trafilatura.extract(downloaded)
+    return None
 
-    async def translate_text(self, text: str) -> str:
-        """Перевод текста через Gemini"""
-        try:
-            prompt = f"Переведи текст на русский, сохрани смысл и структуру:\n\n{text}"
-            response = await asyncio.to_thread(self.model.generate_content, prompt)
-            return response.text.strip()
-        except Exception as e:
-            logger.error(f"Ошибка перевода: {e}")
-            return text
+async def translate_text(text):
+    prompt = f"""Переведи следующий текст на русский язык, сохранив смысл и структуру, но:
+- Удали любые строки с пометками вида "(Оценка:...)" или "Re:".
+- Удали дублирующиеся предложения или абзацы.
+- Игнорируй технические и служебные вставки, которые не относятся к содержанию статьи.
+- Оставь только связный, чистый и читабельный текст.
 
-    async def send_to_telegram(self, title: str, translated_text: str, link: str):
-        """Отправка поста в Telegram"""
-        post = f"🔥 <b>{title}</b>\n\n✍️ {translated_text}\n\n🔗 <a href='{link}'>Читать оригинал</a>"
-        try:
-            async with self.session.post(
-                f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": Config.TELEGRAM_CHANNEL_ID,
-                    "text": post,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": False
-                }
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"Ошибка отправки в Telegram: {resp.status}")
-        except Exception as e:
-            logger.error(f"Ошибка Telegram API: {e}")
+Текст для перевода:
 
-    async def process_and_post(self):
-        """Основная логика"""
-        logger.info("Загрузка топ новости...")
-        story = await self.get_top_story()
-        if not story:
-            logger.warning("Нет новостей для публикации")
-            return
+{text}"""
+    resp = model.generate_content(prompt)
+    return resp.text.strip()
 
-        logger.info(f"Новость: {story['title']}")
-        article_text = await self.fetch_article_text(story["link"])
-        translated_title = await self.translate_text(story["title"])
-        translated_article = await self.translate_text(article_text)
-        await self.send_to_telegram(translated_title, translated_article, story["link"])
+async def post_news():
+    posted = load_posted()
+    entries = await fetch_hn_top()
 
+    for entry in entries:
+        if entry.link in posted:
+            continue  # пропускаем уже постнутые
+        full_text = await get_full_text(entry.link)
+        if not full_text:
+            continue
+        translated = await translate_text(full_text)
+        message = f"🔥 *{entry.title}*\n\n{translated}\n\n🔗 {entry.link}"
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
+        posted.append(entry.link)
+        save_posted(posted)
+        break  # публикуем только одну новость за запуск
+
+# === Планировщик ===
 async def main():
-    async with aiohttp.ClientSession() as session:
-        bot = HackerNewsBot(session)
-        scheduler = AsyncIOScheduler(timezone=Config.TIMEZONE)
-
-        # Пост сразу при запуске
-        await bot.process_and_post()
-
-        # Запуск по расписанию
-        for t in Config.POST_TIMES:
-            h, m = map(int, t.split(':'))
-            scheduler.add_job(bot.process_and_post, CronTrigger(hour=h, minute=m))
-        scheduler.start()
-
-        while True:
-            await asyncio.sleep(60)
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    scheduler.add_job(post_news, "cron", hour=9, minute=0)
+    scheduler.add_job(post_news, "cron", hour=12, minute=0)
+    scheduler.add_job(post_news, "cron", hour=18, minute=0)
+    scheduler.start()
+    print("Бот запущен. Ждём времени постинга...")
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
