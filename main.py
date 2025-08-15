@@ -107,7 +107,7 @@ class GeminiTranslator:
     
     def __init__(self):
         genai.configure(api_key=Config.GEMINI_API_KEY)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        self.model = genai.GenerativeModel('gemini-2.5-flash')
     
     async def translate_to_russian(self, text: str) -> str:
         """Перевод текста на русский"""
@@ -171,7 +171,7 @@ class TelegramPoster:
             post += f"💬 {item['points']} очков\n"
             post += f"🔗 <a href='{item['link']}'>Читать далее</a>\n\n"
         
-        post += "📡 <i>Автоматическая подборка от TechNewsBot</i>"
+        post += "📡 <i>Технические новости</i>"
         return post
 
 class TechNewsBot:
@@ -246,6 +246,10 @@ class TechNewsBot:
     
     async def run_forever(self):
         """Запуск бота в режиме демона"""
+        # Сразу постим топ новость при запуске
+        logger.info("🔥 Постим стартовую новость при запуске...")
+        await self.post_startup_news()
+        
         self.setup_scheduler()
         self.scheduler.start()
         
@@ -260,6 +264,39 @@ class TechNewsBot:
             logger.info("Получен сигнал остановки")
         finally:
             self.scheduler.shutdown()
+    
+    async def post_startup_news(self):
+        """Постинг топ новости при запуске бота"""
+        try:
+            # Получаем только топ-1 новость
+            news_items = await self.parser.get_top_stories()
+            
+            if not news_items:
+                logger.warning("Не удалось получить стартовую новость")
+                return
+            
+            top_news = news_items[0]  # Берем только топ-1
+            logger.info(f"Получена топ новость: {top_news['title'][:50]}...")
+            
+            # Переводим заголовок
+            translated_title = await self.translator.translate_to_russian(top_news['title'])
+            
+            # Формируем стартовый пост
+            startup_post = f"🔥 <b>Топ новость HackerNews:</b>\n\n"
+            startup_post += f"<b>{translated_title}</b>\n"
+            startup_post += f"💬 {top_news['points']} очков\n"
+            startup_post += f"🔗 <a href='{top_news['link']}'>Читать далее</a>"
+            
+            # Отправляем
+            success = await self.poster.send_message(startup_post)
+            
+            if success:
+                logger.info("🎉 Стартовая новость успешно опубликована!")
+            else:
+                logger.error("❌ Ошибка публикации стартовой новости")
+                
+        except Exception as e:
+            logger.error(f"Ошибка в post_startup_news: {e}")
 
 async def main():
     """Основная функция запуска"""
