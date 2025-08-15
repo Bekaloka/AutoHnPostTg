@@ -4,3 +4,4 @@ google-generativeai>=0.3.0
 APScheduler>=3.10.4
 trafilatura
 python-telegram-bot==20.3
+schedule
